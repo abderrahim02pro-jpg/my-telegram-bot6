@@ -11,30 +11,30 @@ from telebot.types import (
 )
 
 # ==========================================
-# 1. إعدادات البيئة والأمان (Security Setup)
+# 1. Security & Environment Setup
 # ==========================================
 BOT_TOKEN = os.environ.get("8892223974:AAHTrRcVB-C8M_mgwi1YOn7bDN4T7vuA3Xs")
 ADMIN_ID_RAW = os.environ.get("6536672093", "0")
 
 if not BOT_TOKEN:
-    raise ValueError("❌ خطأ: لم يتم العثور على BOT_TOKEN في متغيرات البيئة.")
+    raise ValueError("Error: BOT_TOKEN is missing in environment variables.")
 
 try:
     ADMIN_ID = int(ADMIN_ID_RAW)
 except ValueError:
-    raise ValueError("❌ خطأ: ADMIN_ID يجب أن يكون رقماً صحيحاً.")
+    raise ValueError("Error: ADMIN_ID environment variable must be an integer.")
 
 DB_NAME = "bot_database.db"
 VALID_OPERATORS = ["MOBILIS", "DJEZZY", "OOREDOO"]
 
 # ==========================================
-# 2. سيرفر الحفاظ على التشغيل (Keep Alive)
+# 2. Flask Keep-Alive Background Web Server
 # ==========================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🤖 البوت يعمل بنجاح 24/7!", 200
+    return "Bot status: ONLINE 24/7", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -45,7 +45,7 @@ def start_keep_alive():
     server_thread.start()
 
 # ==========================================
-# 3. إدارة قاعدة البيانات (SQLite Architecture)
+# 3. Database Layer & Atomic Operations
 # ==========================================
 def get_db():
     return sqlite3.connect(DB_NAME, check_same_thread=False)
@@ -54,7 +54,7 @@ def init_db():
     with get_db() as conn:
         cursor = conn.cursor()
         
-        # 1. جدول المستخدمين
+        # 1. Users Table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -64,7 +64,7 @@ def init_db():
             )
         ''')
         
-        # 2. جدول الإيميلات
+        # 2. Emails Table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS emails (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,7 +74,7 @@ def init_db():
             )
         ''')
         
-        # 3. جدول عمليات السحب
+        # 3. Withdrawals Table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,7 +86,7 @@ def init_db():
             )
         ''')
         
-        # 4. جدول الإعدادات
+        # 4. Settings Table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -94,7 +94,7 @@ def init_db():
             )
         ''')
         
-        # القيم الافتراضية للإعدادات
+        # Pre-populate settings defaults
         defaults = [
             ('reward_per_email', '50'),
             ('min_withdrawal', '100'),
@@ -138,7 +138,7 @@ def get_available_emails():
         return cursor.fetchall()
 
 def reserve_email(email_id: int, user_id: int) -> bool:
-    """حجز الإيميل لمنع مستخدمين متعددين من اختياره في نفس الوقت"""
+    """Atomic check-and-update to prevent race conditions across multiple users."""
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -242,7 +242,7 @@ def reject_withdrawal(w_id: int):
         return {"user_id": user_id, "amount": amount}
 
 # ==========================================
-# 4. واجهة التفاعل للبوت (Telegram Bot Rules)
+# 4. Telegram Bot Core Workflow & Logic
 # ==========================================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
@@ -409,7 +409,7 @@ def process_withdrawal_input(message):
     try:
         parts = message.text.strip().split()
         if len(parts) != 3:
-            raise ValueError()
+            raise ValueError("Invalid format")
 
         operator = parts[0].upper()
         phone = parts[1]
@@ -488,7 +488,7 @@ def handle_admin_withdrawal_review(call):
         else:
             bot.answer_callback_query(call.id, "الطلب غير موجود أو تم معالجته سابقاً.", show_alert=True)
 
-# --- أوامر التحكم للأدمن ---
+# --- Admin Control Panel Commands ---
 @bot.message_handler(commands=['add_emails'])
 def admin_add_emails(message):
     if not is_admin(message.from_user.id):
@@ -520,6 +520,4 @@ def admin_set_min(message):
         bot.reply_to(message, "الصيغة: <code>/set_min 100</code>")
         return
     set_setting("min_withdrawal", val)
-    bot.reply_to(message, f"✅ تم تحديث الحد الأدنى للسحب إلى: <b>{val} دج</b>")
-
-@bot.messag
+    bot.reply_to(message, f"✅ تم تحديث الحد الأدنى للسحب إلى: <b
