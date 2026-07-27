@@ -13,8 +13,8 @@ from telebot.types import (
 # ==========================================
 # 1. Security & Environment Setup
 # ==========================================
-BOT_TOKEN = os.environ.get("8892223974:AAHTrRcVB-C8M_mgwi1YOn7bDN4T7vuA3Xs")
-ADMIN_ID_RAW = os.environ.get("6536672093", "0")
+BOT_TOKEN = "8892223974:AAHTrRcVB-C8M_mgwi1YOn7bDN4T7vuA3Xs"
+ADMIN_ID_RAW = "6536672093"
 
 if not BOT_TOKEN:
     raise ValueError("Error: BOT_TOKEN is missing in environment variables.")
