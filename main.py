@@ -3,531 +3,236 @@ import sqlite3
 from threading import Thread
 from flask import Flask
 import telebot
-from telebot.types import (
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton
-)
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ==========================================
-# 1. Security & Environment Setup
-# ==========================================
 BOT_TOKEN = "8758366357:AAGPz5MnqyZOjBeTtxPn1FdTM2HMLpDY3Ug"
-ADMIN_ID_RAW = "6536672093"
+ADMIN_ID = 6536672093
 
-if not BOT_TOKEN:
-    raise ValueError("Error: BOT_TOKEN is missing in environment variables.")
-
-try:
-    ADMIN_ID = int(ADMIN_ID_RAW)
-except ValueError:
-    raise ValueError("Error: ADMIN_ID environment variable must be an integer.")
+bot = telebot.TeleBot(BOT_TOKEN)
 
 DB_NAME = "bot_database.db"
-VALID_OPERATORS = ["MOBILIS", "DJEZZY", "OOREDOO"]
 
-# ==========================================
-# 2. Flask Keep-Alive Background Web Server
-# ==========================================
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS emails (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            first_name TEXT NOT NULL,
+            last_name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            balance REAL DEFAULT 0.0,
+            status TEXT DEFAULT 'AVAILABLE',
+            assigned_user_id INTEGER DEFAULT NULL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawal_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            email_id INTEGER NOT NULL,
+            status TEXT DEFAULT 'PENDING'
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def add_full_email_db(first_name, last_name, email, password, balance):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO emails (first_name, last_name, email, password, balance, status)
+            VALUES (?, ?, ?, ?, ?, 'AVAILABLE')
+        """, (first_name, last_name, email, password, balance))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+def get_available_emails_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, first_name, last_name, email, balance FROM emails WHERE status = 'AVAILABLE'")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def request_email_withdraw(user_id, email_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE emails SET status = 'PENDING', assigned_user_id = ? WHERE id = ? AND status = 'AVAILABLE'", (user_id, email_id))
+    if cursor.rowcount > 0:
+        cursor.execute("INSERT INTO withdrawal_requests (user_id, email_id) VALUES (?, ?)", (user_id, email_id))
+        req_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return req_id
+    conn.close()
+    return None
+
+def approve_withdrawal_db(req_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, email_id FROM withdrawal_requests WHERE id = ?", (req_id,))
+    row = cursor.fetchone()
+    if row:
+        user_id, email_id = row
+        cursor.execute("UPDATE emails SET status = 'SOLD' WHERE id = ?", (email_id,))
+        cursor.execute("UPDATE withdrawal_requests SET status = 'APPROVED' WHERE id = ?", (req_id,))
+        conn.commit()
+        conn.close()
+        return user_id, email_id
+    conn.close()
+    return None, None
+
+def reject_withdrawal_db(req_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, email_id FROM withdrawal_requests WHERE id = ?", (req_id,))
+    row = cursor.fetchone()
+    if row:
+        user_id, email_id = row
+        cursor.execute("UPDATE emails SET status = 'AVAILABLE', assigned_user_id = NULL WHERE id = ?", (email_id,))
+        cursor.execute("UPDATE withdrawal_requests SET status = 'REJECTED' WHERE id = ?", (req_id,))
+        conn.commit()
+        conn.close()
+        return user_id, email_id
+    conn.close()
+    return None, None
+
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot status: ONLINE 24/7", 200
+    return "Bot is running 24/7!"
 
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=8080)
 
-def start_keep_alive():
-    server_thread = Thread(target=run_flask, daemon=True)
-    server_thread.start()
-
-# ==========================================
-# 3. Database Layer & Atomic Operations
-# ==========================================
-def get_db():
-    # إنشاء اتصال حديث لكل خيط لضمان عدم حدوث تعارض (Thread safety)
-    return sqlite3.connect(DB_NAME)
-
-def init_db():
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        # 1. Users Table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                balance REAL DEFAULT 0.0,
-                pending_balance REAL DEFAULT 0.0
-            )
-        ''')
-        
-        # 2. Emails Table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS emails (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT UNIQUE,
-                status TEXT DEFAULT 'available',
-                reserved_by INTEGER DEFAULT NULL
-            )
-        ''')
-        
-        # 3. Withdrawals Table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS withdrawals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                amount REAL,
-                phone_number TEXT,
-                operator TEXT,
-                status TEXT DEFAULT 'pending'
-            )
-        ''')
-        
-        # 4. Settings Table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        ''')
-        
-        # Pre-populate settings defaults
-        defaults = [
-            ('reward_per_email', '50'),
-            ('min_withdrawal', '100'),
-            ('msg_success', 'تم شحن رصيدك بنجاح بمبلغ {amount} دج!'),
-            ('msg_reject', 'تم رفض طلب السحب الخاص بك. يرجى إعادة إرسال رقم هاتف صالح للاستقبال.')
-        ]
-        cursor.executemany("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", defaults)
-        conn.commit()
-
-def get_setting(key: str) -> str:
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = cursor.fetchone()
-        return row[0] if row else ""
-
-def set_setting(key: str, value: str):
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-        conn.commit()
-
-def get_or_create_user(user_id: int, username: str):
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, username, balance, pending_balance FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        if not row:
-            cursor.execute(
-                "INSERT INTO users (user_id, username, balance, pending_balance) VALUES (?, ?, 0.0, 0.0)",
-                (user_id, username or "Unknown")
-            )
-            conn.commit()
-            return {"user_id": user_id, "username": username, "balance": 0.0, "pending_balance": 0.0}
-        return {"user_id": row[0], "username": row[1], "balance": row[2], "pending_balance": row[3]}
-
-def get_available_emails():
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, email FROM emails WHERE status = 'available'")
-        return cursor.fetchall()
-
-def reserve_email(email_id: int, user_id: int) -> bool:
-    """Atomic check-and-update to prevent race conditions across multiple users."""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE emails SET status = 'reserved', reserved_by = ? WHERE id = ? AND status = 'available'",
-            (user_id, email_id)
-        )
-        conn.commit()
-        return cursor.rowcount > 0
-
-def get_email_by_id(email_id: int):
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, email, status, reserved_by FROM emails WHERE id = ?", (email_id,))
-        return cursor.fetchone()
-
-def approve_email_task(email_id: int, user_id: int, reward: float) -> bool:
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT status FROM emails WHERE id = ?", (email_id,))
-        row = cursor.fetchone()
-        if not row or row[0] != 'reserved':
-            return False
-        cursor.execute("UPDATE emails SET status = 'completed' WHERE id = ?", (email_id,))
-        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (reward, user_id))
-        conn.commit()
-        return True
-
-def reject_email_task(email_id: int) -> bool:
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT status FROM emails WHERE id = ?", (email_id,))
-        row = cursor.fetchone()
-        if not row or row[0] != 'reserved':
-            return False
-        cursor.execute("UPDATE emails SET status = 'available', reserved_by = NULL WHERE id = ?", (email_id,))
-        conn.commit()
-        return True
-
-def batch_add_emails(email_list: list) -> int:
-    added = 0
-    with get_db() as conn:
-        cursor = conn.cursor()
-        for e in email_list:
-            cleaned = e.strip()
-            if cleaned:
-                try:
-                    cursor.execute("INSERT INTO emails (email) VALUES (?)", (cleaned,))
-                    added += 1
-                except sqlite3.IntegrityError:
-                    pass
-        conn.commit()
-    return added
-
-def create_withdrawal(user_id: int, amount: float, phone: str, operator: str):
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        if not row or row[0] < amount:
-            return None
-        
-        cursor.execute(
-            "UPDATE users SET balance = balance - ?, pending_balance = pending_balance + ? WHERE user_id = ?",
-            (amount, amount, user_id)
-        )
-        cursor.execute(
-            "INSERT INTO withdrawals (user_id, amount, phone_number, operator, status) VALUES (?, ?, ?, ?, 'pending')",
-            (user_id, amount, phone, operator)
-        )
-        w_id = cursor.lastrowid
-        conn.commit()
-        return w_id
-
-def approve_withdrawal(w_id: int):
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, amount, status FROM withdrawals WHERE id = ?", (w_id,))
-        row = cursor.fetchone()
-        if not row or row[2] != 'pending':
-            return None
-        user_id, amount, _ = row
-        cursor.execute("UPDATE users SET pending_balance = pending_balance - ? WHERE user_id = ?", (amount, user_id))
-        cursor.execute("UPDATE withdrawals SET status = 'approved' WHERE id = ?", (w_id,))
-        conn.commit()
-        return {"user_id": user_id, "amount": amount}
-
-def reject_withdrawal(w_id: int):
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, amount, status FROM withdrawals WHERE id = ?", (w_id,))
-        row = cursor.fetchone()
-        if not row or row[2] != 'pending':
-            return None
-        user_id, amount, _ = row
-        cursor.execute(
-            "UPDATE users SET pending_balance = pending_balance - ?, balance = balance + ? WHERE user_id = ?",
-            (amount, amount, user_id)
-        )
-        cursor.execute("UPDATE withdrawals SET status = 'rejected' WHERE id = ?", (w_id,))
-        conn.commit()
-        return {"user_id": user_id, "amount": amount}
-
-# ==========================================
-# 4. Telegram Bot Core Workflow & Logic
-# ==========================================
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-
-MAIN_KEYBOARD = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-MAIN_KEYBOARD.add(KeyboardButton("📧 الإيميلات المتاحة"), KeyboardButton("💰 حسابي وسحب الأرباح"))
-
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
-
-@bot.message_handler(commands=['start'])
-def handle_start(message):
-    get_or_create_user(message.from_user.id, message.from_user.username)
-    welcome_text = (
-        f"مرحباً بك <b>{message.from_user.first_name}</b> في بوت المهام المصغرة! 🇩🇿\n\n"
-        "قم بإنشاء الإيميلات المطلوبة واكسب رصيداً يمكنك سحبه مباشرة عبر خدمات الفليكسي (Mobilis, Djezzy, Ooredoo).\n\n"
-        "استخدم القائمة أدناه للبدء 👇"
+def admin_panel_keyboard():
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("➕ إضافة إيميل جديد", callback_data="admin_add_full_email"),
+        InlineKeyboardButton("📋 عرض الإيميلات المتاحة", callback_data="admin_list_emails")
     )
-    bot.send_message(message.chat.id, welcome_text, reply_markup=MAIN_KEYBOARD)
+    return markup
 
-@bot.message_handler(func=lambda msg: msg.text == "📧 الإيميلات المتاحة")
-def handle_available_emails(message):
-    emails = get_available_emails()
+@bot.message_handler(commands=['start', 'admin'])
+def start_cmd(message):
+    if message.from_user.id == ADMIN_ID:
+        bot.reply_to(message, "⚙️ **لوحة تحكم الأدمن:**\nاختر العملية المطلوبة:", reply_markup=admin_panel_keyboard(), parse_mode="Markdown")
+    else:
+        show_user_emails(message.chat.id)
+
+def show_user_emails(chat_id):
+    emails = get_available_emails_db()
     if not emails:
-        bot.send_message(message.chat.id, "❌ لا توجد إيميلات متاحة للعمل حالياً. يرجى المحاولة لاحقاً.")
+        bot.send_message(chat_id, "📭 لا توجد إيميلات متاحة حالياً للسحب.")
         return
-
+    
     markup = InlineKeyboardMarkup()
-    for e_id, email_str in emails:
-        markup.add(InlineKeyboardButton(text=f"✉️ {email_str}", callback_data=f"select_email_{e_id}"))
+    for e in emails:
+        btn_text = f"📧 {e[3]} | الرصيد: {e[4]}$"
+        markup.add(InlineKeyboardButton(btn_text, callback_data=f"user_claim_{e[0]}"))
+        
+    bot.send_message(chat_id, "🎁 **الإيميلات المتاحة للسحب:**\nاضغط على الإيميل لطلبه:", reply_markup=markup, parse_mode="Markdown")
 
-    bot.send_message(message.chat.id, "اختر إيميل لبدء المهمة:", reply_markup=markup)
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(call):
+    if call.data == "admin_add_full_email" and call.from_user.id == ADMIN_ID:
+        msg = bot.send_message(
+            call.message.chat.id, 
+            "✏️ أرسل بيانات الإيميل مفصولة بكلمة **`|`** بالنظام التالي:\n\n"
+            "`الاسم | اللقب | الإيميل | كلمة السر | رصيد السحب`\n\n"
+            "*مثال:*\n`محمد | بن علي | test@gmail.com | pass123 | 50`",
+            parse_mode="Markdown"
+        )
+        bot.register_next_step_handler(msg, process_add_full_email)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("select_email_"))
-def handle_email_selection(call):
-    email_id = int(call.data.split("_")[2])
-    user_id = call.from_user.id
-
-    if not reserve_email(email_id, user_id):
-        bot.answer_callback_query(call.id, "⚠️ عذراً، تم حجز هذا الإيميل من قبل مستخدم آخر!", show_alert=True)
-        return
-
-    email_data = get_email_by_id(email_id)
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton(text="تم إنشاء الإيميل بالفعل ✅", callback_data=f"done_email_{email_id}"))
-
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text=(
-            f"لقد قمت بحجز الإيميل التالي:\n<code>{email_data[1]}</code>\n\n"
-            "يرجى إنشاؤه فوراً ثم اضغط على الزر أدناه لتأكيد الإنجاز."
-        ),
-        reply_markup=markup
-    )
-    bot.answer_callback_query(call.id, "تم حجز الإيميل لك!")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("done_email_"))
-def handle_email_done(call):
-    email_id = int(call.data.split("_")[2])
-    user_id = call.from_user.id
-    email_data = get_email_by_id(email_id)
-
-    if not email_data or email_data[3] != user_id:
-        bot.answer_callback_query(call.id, "حدث خطأ أو أن الإيميل غير محجوز باسمك.", show_alert=True)
-        return
-
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text="تم إرسال المهمة للمراجعة من قبل الإدارة ⏳. سيتم إضافة الرصيد لحسابك فور التحقق."
-    )
-
-    admin_markup = InlineKeyboardMarkup()
-    admin_markup.row(
-        InlineKeyboardButton("موافقة (إضافة رصيد) ✅", callback_data=f"app_e_{email_id}_{user_id}"),
-        InlineKeyboardButton("رفض ❌", callback_data=f"rej_e_{email_id}_{user_id}")
-    )
-
-    reward_str = get_setting("reward_per_email")
-    bot.send_message(
-        ADMIN_ID,
-        f"📥 <b>مهمة إنشاء إيميل جديدة للمراجعة</b>:\n\n"
-        f"• الإيميل: <code>{email_data[1]}</code>\n"
-        f"• المستخدم: @{call.from_user.username or 'بدون_معرف'} (ID: <code>{user_id}</code>)\n"
-        f"• القيمة: {reward_str} دج",
-        reply_markup=admin_markup
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith(("app_e_", "rej_e_")))
-def handle_admin_email_review(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "غير مصرح لك القيام بهذا الإجراء.", show_alert=True)
-        return
-
-    parts = call.data.split("_")
-    action = parts[0]
-    email_id = int(parts[2])
-    target_user_id = int(parts[3])
-
-    if action == "app":
-        reward = float(get_setting("reward_per_email"))
-        if approve_email_task(email_id, target_user_id, reward):
-            bot.edit_message_text(
-                f"{call.message.text}\n\n✅ <b>تمت الموافقة وإضافة الرصيد للمستخدم.</b>",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
-            user_msg = get_setting("msg_success").replace("{amount}", str(reward))
-            bot.send_message(target_user_id, user_msg)
+    elif call.data == "admin_list_emails" and call.from_user.id == ADMIN_ID:
+        emails = get_available_emails_db()
+        if not emails:
+            bot.send_message(call.message.chat.id, "📭 لا توجد إيميلات متاحة.")
         else:
-            bot.answer_callback_query(call.id, "تعذر معالجة الطلب.", show_alert=True)
+            txt = "📋 **قائمة الإيميلات المتاحة:**\n\n"
+            for e in emails:
+                txt += f"• **الاسم:** {e[1]} {e[2]}\n  **الإيميل:** `{e[3]}`\n  **الرصيد:** {e[4]}$\n\n"
+            bot.send_message(call.message.chat.id, txt, parse_mode="Markdown")
 
-    elif action == "rej":
-        if reject_email_task(email_id):
-            bot.edit_message_text(
-                f"{call.message.text}\n\n❌ <b>تم رفض المهمة وإعادة الإيميل للقائمة.</b>",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
+    elif call.data.startswith("user_claim_"):
+        email_id = int(call.data.split("_")[2])
+        req_id = request_email_withdraw(call.from_user.id, email_id)
+        
+        if req_id:
+            bot.answer_callback_query(call.id, "تم إرسال طلبك للأدمن للموافقة ⏳")
+            bot.send_message(call.message.chat.id, "⏳ **تم تقديم طلبك بنجاح.**\nسيرسل لك البوت البيانات فور موافقة الأدمن.")
+            
+            admin_markup = InlineKeyboardMarkup()
+            admin_markup.row(
+                InlineKeyboardButton("✅ موافقة", callback_data=f"adm_app_{req_id}"),
+                InlineKeyboardButton("❌ رفض وإرجاع", callback_data=f"adm_rej_{req_id}")
             )
-            bot.send_message(target_user_id, "⚠️ تم رفض مهمة إنشاء الإيميل الخاصة بك. يرجى اتباع التعليمات بدقة.")
+            bot.send_message(
+                ADMIN_ID,
+                f"🔔 **طلب سحب جديد!**\n\n"
+                f"👤 **المستخدم:** [{call.from_user.first_name}](tg://user?id={call.from_user.id})\n"
+                f"🆔 **المعرف:** `{call.from_user.id}`",
+                reply_markup=admin_markup,
+                parse_mode="Markdown"
+            )
         else:
-            bot.answer_callback_query(call.id, "تعذر معالجة الطلب.", show_alert=True)
+            bot.answer_callback_query(call.id, "❌ عفواً، هذا الإيميل لم يعد متاحاً!", show_alert=True)
 
-@bot.message_handler(func=lambda msg: msg.text == "💰 حسابي وسحب الأرباح")
-def handle_account_info(message):
-    user = get_or_create_user(message.from_user.id, message.from_user.username)
-    min_w = float(get_setting("min_withdrawal"))
+    elif call.data.startswith("adm_app_") and call.from_user.id == ADMIN_ID:
+        req_id = int(call.data.split("_")[2])
+        user_id, email_id = approve_withdrawal_db(req_id)
+        if user_id:
+            conn = sqlite3.connect(DB_NAME)
+            c = conn.cursor()
+            c.execute("SELECT first_name, last_name, email, password, balance FROM emails WHERE id = ?", (email_id,))
+            item = c.fetchone()
+            conn.close()
+            
+            bot.send_message(
+                user_id,
+                f"🎉 **تمت الموافقة على طلبك!**\n\n"
+                f"👤 **الاسم الكامل:** {item[0]} {item[1]}\n"
+                f"📧 **الإيميل:** `{item[2]}`\n"
+                f"🔑 **كلمة السر:** `{item[3]}`\n"
+                f"💰 **رصيد السحب:** {item[4]}$",
+                parse_mode="Markdown"
+            )
+            bot.edit_message_text("✅ تم قبول الطلب وإرسال البيانات للمستخدم وخروج الإيميل من المتاح.", call.message.chat.id, call.message.message_id)
 
-    text = (
-        f"📊 <b>تفاصيل حسابك</b>:\n\n"
-        f"• الرصيد المتاح: <b>{user['balance']:.2f} دج</b>\n"
-        f"• الرصيد المعلق: <b>{user['pending_balance']:.2f} دج</b>\n"
-        f"• الحد الأدنى للسحب: <b>{min_w:.2f} دج</b>"
-    )
+    elif call.data.startswith("adm_rej_") and call.from_user.id == ADMIN_ID:
+        req_id = int(call.data.split("_")[2])
+        user_id, email_id = reject_withdrawal_db(req_id)
+        if user_id:
+            bot.send_message(user_id, "❌ **عذراً، تم رفض طلب السحب الخاص بك من قبل الأدمن.**")
+            bot.edit_message_text("❌ تم رفض الطلب وإعادة الإيميل للقائمة المتاحة تلقائياً.", call.message.chat.id, call.message.message_id)
 
-    markup = InlineKeyboardMarkup()
-    if user['balance'] >= min_w:
-        markup.add(InlineKeyboardButton("طلب سحب رصيد (فليكسي) 📱", callback_data="start_withdrawal"))
-
-    bot.send_message(message.chat.id, text, reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data == "start_withdrawal")
-def prompt_withdrawal_data(call):
-    user = get_or_create_user(call.from_user.id, call.from_user.username)
-    min_w = float(get_setting("min_withdrawal"))
-
-    if user['balance'] < min_w:
-        bot.answer_callback_query(call.id, "رصيدك غير كافٍ للسحب حالياً.", show_alert=True)
-        return
-
-    msg = bot.send_message(
-        call.message.chat.id,
-        "يرجى إرسال بيانات السحب بالصيغة التالية:\n\n"
-        "<code>المتعامل رقم_الهاتف المبلغ</code>\n\n"
-        "أمثلة:\n"
-        "• <code>Mobilis 0661234567 100</code>\n"
-        "• <code>Djezzy 0771234567 200</code>\n"
-        "• <code>Ooredoo 0551234567 150</code>"
-    )
-    bot.register_next_step_handler(msg, process_withdrawal_input)
-    bot.answer_callback_query(call.id)
-
-def process_withdrawal_input(message):
+def process_add_full_email(message):
     try:
-        parts = message.text.strip().split()
-        if len(parts) != 3:
-            raise ValueError("Invalid format")
-
-        operator = parts[0].upper()
-        phone = parts[1]
-        amount = float(parts[2])
-
-        if operator not in VALID_OPERATORS:
-            bot.send_message(message.chat.id, "❌ متعامل غير معروف! يرجى اختيار (Mobilis, Djezzy, أو Ooredoo).")
+        data = [item.strip() for item in message.text.split("|")]
+        if len(data) != 5:
+            bot.reply_to(message, "❌ صيغة البيانات غير صحيحة. يرجى التأكد من فصل العناصر الخمسة بـ `|`", parse_mode="Markdown")
             return
-
-        min_w = float(get_setting("min_withdrawal"))
-        if amount < min_w:
-            bot.send_message(message.chat.id, f"❌ المبلغ المطلوب أقل من الحد الأدنى للسحب ({min_w} دج).")
-            return
-
-        w_id = create_withdrawal(message.from_user.id, amount, phone, operator)
-        if not w_id:
-            bot.send_message(message.chat.id, "❌ رصيدك الحالي لا يكفي لطلب هذا المبلغ.")
-            return
-
-        bot.send_message(
-            message.chat.id,
-            "✅ تم تقديم طلب السحب بنجاح وهو قيد المراجعة.\n"
-            "تم خصم المبلغ ونقله للرصيد المعلق مؤقتاً."
-        )
-
-        admin_markup = InlineKeyboardMarkup()
-        admin_markup.row(
-            InlineKeyboardButton("تم الشحن (موافقة) ✅", callback_data=f"app_w_{w_id}"),
-            InlineKeyboardButton("رفض (رقم خاطئ) ❌", callback_data=f"rej_w_{w_id}")
-        )
-
-        bot.send_message(
-            ADMIN_ID,
-            f"📱 <b>طلب سحب رصيد جديد (فليكسي)</b>:\n\n"
-            f"• المستخدم: @{message.from_user.username or 'بدون_معرف'} (ID: <code>{message.from_user.id}</code>)\n"
-            f"• المتعامل: <b>{operator}</b>\n"
-            f"• الرقم: <code>{phone}</code>\n"
-            f"• المبلغ: <b>{amount} دج</b>",
-            reply_markup=admin_markup
-        )
-
-    except Exception:
-        bot.send_message(message.chat.id, "❌ صيغة المدخلات غير صحيحة. يرجى المحاولة مجدداً والالتزام بالصيغة: <code>المتعامل رقم_الهاتف المبلغ</code>")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith(("app_w_", "rej_w_")))
-def handle_admin_withdrawal_review(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "غير مصرح لك القيام بهذا الإجراء.", show_alert=True)
-        return
-
-    parts = call.data.split("_")
-    action = parts[0]
-    w_id = int(parts[2])
-
-    if action == "app":
-        res = approve_withdrawal(w_id)
-        if res:
-            bot.edit_message_text(
-                f"{call.message.text}\n\n✅ <b>تمت الموافقة وتأكيد شحن الفليكسي.</b>",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
-            bot.send_message(res['user_id'], f"🎉 تم شحن رصيدك (فليكسي) بنجاح بمبلغ {res['amount']} دج!")
+        
+        first_name, last_name, email, password, balance = data[0], data[1], data[2], data[3], float(data[4])
+        
+        if add_full_email_db(first_name, last_name, email, password, balance):
+            bot.reply_to(message, f"✅ **تم إضافة الإيميل بنجاح!**\n• الإيميل: `{email}`\n• الرصيد: {balance}$", parse_mode="Markdown", reply_markup=admin_panel_keyboard())
         else:
-            bot.answer_callback_query(call.id, "الطلب غير موجود أو تم معالجته سابقاً.", show_alert=True)
+            bot.reply_to(message, "⚠️ هذا الإيميل موجود مسجل مسبقاً!", reply_markup=admin_panel_keyboard())
+    except Exception as e:
+        bot.reply_to(message, f"❌ حدث خطأ في البيانات أدخلت بشكل غير صحيح: {e}")
 
-    elif action == "rej":
-        res = reject_withdrawal(w_id)
-        if res:
-            bot.edit_message_text(
-                f"{call.message.text}\n\n❌ <b>تم رفض طلب السحب وإعادة الرصيد للمستخدم.</b>",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
-            bot.send_message(res['user_id'], get_setting("msg_reject"))
-        else:
-            bot.answer_callback_query(call.id, "الطلب غير موجود أو تم معالجته سابقاً.", show_alert=True)
-
-# --- Admin Control Panel Commands ---
-@bot.message_handler(commands=['add_emails'])
-def admin_add_emails(message):
-    if not is_admin(message.from_user.id):
-        return
-    raw_text = message.text.replace("/add_emails", "").strip()
-    if not raw_text:
-        bot.reply_to(message, "الصيغة: <code>/add_emails e1@gmail.com, e2@gmail.com</code>")
-        return
-    count = batch_add_emails(raw_text.split(","))
-    bot.reply_to(message, f"✅ تم إضافة {count} إيميل متاح بنجاح!")
-
-@bot.message_handler(commands=['set_reward'])
-def admin_set_reward(message):
-    if not is_admin(message.from_user.id):
-        return
-    val = message.text.replace("/set_reward", "").strip()
-    if not val or not val.isdigit():
-        bot.reply_to(message, "الصيغة: <code>/set_reward 50</code>")
-        return
-    set_setting("reward_per_email", val)
-    bot.reply_to(message, f"✅ تم تحديث مكافأة الإيميل إلى: <b>{val} دج</b>")
-
-@bot.message_handler(commands=['set_min'])
-def admin_set_min(message):
-    if not is_admin(message.from_user.id):
-        return
-    val = message.text.replace("/set_min", "").strip()
-    if not val or not val.isdigit():
-        bot.reply_to(message, "الصيغة: <code>/set_min 100</code>")
-        return
-    set_setting("min_withdrawal", val)
-    bot.reply_to(message, f"✅ تم تحديث الحد الأدنى للسحب إلى: <b>{val} دج</b>")
-
-# ==========================================
-# 5. Application Entry Point
-# ==========================================
 if __name__ == "__main__":
-    init_db()
-    start_keep_alive()
     print("Bot is starting...")
+    Thread(target=run_flask).start()
     bot.infinity_polling(skip_pending=True)
