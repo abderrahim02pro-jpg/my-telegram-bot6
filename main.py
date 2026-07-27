@@ -13,7 +13,7 @@ from telebot.types import (
 # ==========================================
 # 1. Security & Environment Setup
 # ==========================================
-BOT_TOKEN = "8892223974:AAHTrRcVB-C8M_mgwi1YOn7bDN4T7vuA3Xs"
+BOT_TOKEN = "8758366357:AAGPz5MnqyZOjBeTtxPn1FdTM2HMLpDY3Ug"
 ADMIN_ID_RAW = "6536672093"
 
 if not BOT_TOKEN:
